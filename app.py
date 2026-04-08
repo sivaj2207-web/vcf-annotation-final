@@ -19,7 +19,7 @@ def load_database():
     df.columns = df.columns.str.strip()
     df.columns = df.columns.str.replace(r"\s+", "_", regex=True)
 
-    # Rename important columns
+    # Rename safely
     if "SNP_ID" in df.columns:
         df = df.rename(columns={"SNP_ID": "snp_id"})
     if "P-value" in df.columns:
@@ -92,7 +92,7 @@ def parse_vcf(file):
     ])
 
 # =============================
-# MATCHING (FIXED QUERY)
+# MATCHING (SAFE SQL)
 # =============================
 def annotate(vcf_df):
     conn = sqlite3.connect(":memory:")
@@ -100,6 +100,7 @@ def annotate(vcf_df):
     vcf_df.to_sql("vcf", conn, index=False, if_exists="replace")
     db_df.to_sql("db", conn, index=False, if_exists="replace")
 
+    # SAFE QUERY (only guaranteed columns)
     query = """
     SELECT 
         v.snp_id,
@@ -112,9 +113,7 @@ def annotate(vcf_df):
         d.Gene,
         d.Sub_Trait,
         d.p_value,
-        d.phenotype,
-        d.beta_or,
-        d.SAS_MAF
+        d.phenotype
 
     FROM vcf v
     JOIN db d
@@ -127,7 +126,7 @@ def annotate(vcf_df):
     return result
 
 # =============================
-# SAS SCORE
+# SAS SCORE (SAFE)
 # =============================
 def sas_score(df):
     if "SAS_MAF" not in df.columns or len(df) == 0:
@@ -150,19 +149,20 @@ if uploaded_vcf is not None:
 
     st.write("🔄 Processing VCF...")
 
-    vcf_df = parse_vcf(uploaded_vcf)
-    matched_df = annotate(vcf_df)
+    try:
+        vcf_df = parse_vcf(uploaded_vcf)
+        matched_df = annotate(vcf_df)
+
+    except Exception as e:
+        st.error(f"❌ Error during processing: {e}")
+        st.stop()
 
     st.success("✅ Annotation Complete")
 
     st.write("📊 Total SNPs:", len(vcf_df))
     st.write("✅ Matched SNPs:", len(matched_df))
 
-    # SAS Score
-    score = sas_score(matched_df)
-    st.metric("🧬 SAS Score (%)", f"{score:.2f}")
-
-    # SHOW MATCHED SNPs
+    # Show matched SNPs
     st.subheader("🔍 Matched SNPs")
     st.dataframe(matched_df)
 
