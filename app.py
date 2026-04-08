@@ -19,7 +19,7 @@ def load_database():
     df.columns = df.columns.str.strip()
     df.columns = df.columns.str.replace(r"\s+", "_", regex=True)
 
-    # Rename important columns safely
+    # Rename important columns
     if "SNP_ID" in df.columns:
         df = df.rename(columns={"SNP_ID": "snp_id"})
     if "P-value" in df.columns:
@@ -40,9 +40,6 @@ def load_database():
     return df
 
 
-# =============================
-# LOAD DATA
-# =============================
 db_df = load_database()
 
 # =============================
@@ -51,12 +48,10 @@ db_df = load_database()
 st.subheader("📊 Database Preview")
 st.dataframe(db_df.head())
 
-
 # =============================
 # VCF UPLOAD
 # =============================
 uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
-
 
 # =============================
 # PARSE VCF
@@ -96,9 +91,8 @@ def parse_vcf(file):
         "ref", "alt", "genotype"
     ])
 
-
 # =============================
-# MATCHING
+# MATCHING (FIXED QUERY)
 # =============================
 def annotate(vcf_df):
     conn = sqlite3.connect(":memory:")
@@ -107,7 +101,21 @@ def annotate(vcf_df):
     db_df.to_sql("db", conn, index=False, if_exists="replace")
 
     query = """
-    SELECT v.*, d.*
+    SELECT 
+        v.snp_id,
+        v.chromosome,
+        v.position,
+        v.ref,
+        v.alt,
+        v.genotype,
+
+        d.Gene,
+        d.Sub_Trait,
+        d.p_value,
+        d.phenotype,
+        d.beta_or,
+        d.SAS_MAF
+
     FROM vcf v
     JOIN db d
     ON v.snp_id = d.snp_id
@@ -118,7 +126,6 @@ def annotate(vcf_df):
 
     return result
 
-
 # =============================
 # SAS SCORE
 # =============================
@@ -126,7 +133,6 @@ def sas_score(df):
     if "SAS_MAF" not in df.columns or len(df) == 0:
         return 0
     return df["SAS_MAF"].mean() * 100
-
 
 # =============================
 # TOP SNP LOGIC
@@ -136,7 +142,6 @@ def get_top_snps(group):
         return group.head(10)
     else:
         return group.head(5)
-
 
 # =============================
 # RUN PIPELINE
@@ -153,11 +158,11 @@ if uploaded_vcf is not None:
     st.write("📊 Total SNPs:", len(vcf_df))
     st.write("✅ Matched SNPs:", len(matched_df))
 
-    # SAS score
+    # SAS Score
     score = sas_score(matched_df)
     st.metric("🧬 SAS Score (%)", f"{score:.2f}")
 
-    # Show results
+    # SHOW MATCHED SNPs
     st.subheader("🔍 Matched SNPs")
     st.dataframe(matched_df)
 
@@ -177,13 +182,7 @@ if uploaded_vcf is not None:
 
         top_snps = df_top.groupby("Sub_Trait", group_keys=False).apply(get_top_snps)
 
-        st.dataframe(top_snps[[
-            "Sub_Trait",
-            "snp_id",
-            "Gene",
-            "p_value",
-            "phenotype"
-        ]])
+        st.dataframe(top_snps)
 
     else:
         st.warning("No matched SNPs")
@@ -200,7 +199,6 @@ if uploaded_vcf is not None:
         "matched_snps.csv",
         "text/csv"
     )
-
 
 # =============================
 # RSID SEARCH
