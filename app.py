@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import sqlite3
 
 # =============================
 # TITLE
@@ -7,32 +8,52 @@ import pandas as pd
 st.title("🧬 VCF Variant Annotation Tool")
 
 # =============================
-# LOAD DATABASE (CSV)
+# LOAD DATABASE
 # =============================
 @st.cache_data
 def load_database():
-    df = pd.read_csv("annotated_table.csv")
+    df = pd.read_csv("annotated_table_updated.csv")
 
+    # Clean column names
+    df.columns = df.columns.astype(str)
     df.columns = df.columns.str.strip()
+    df.columns = df.columns.str.replace(r"\s+", "_", regex=True)
 
-    df = df.rename(columns={
-        "SNP_ID": "snp_id",
-        "Chromosome No.": "chromosome",
-        "Chromosome Position (GRCh38)": "position",
-        "Reference_Allele/MAJOR_ALLELE": "ref",
-        "Alternate_Allele": "alt",
-        "Phenotypic Description": "phenotype",
-        "Cytogenic region": "cytogenic_region",
-        "P-value": "p_value",
-        "Beta/Odds Ratio (Effect size)": "beta_or",
-        "Sample size": "sample_size"
-    })
+    # Rename important columns safely
+    if "SNP_ID" in df.columns:
+        df = df.rename(columns={"SNP_ID": "snp_id"})
+    if "P-value" in df.columns:
+        df = df.rename(columns={"P-value": "p_value"})
+    if "Phenotype_Description" in df.columns:
+        df = df.rename(columns={"Phenotype_Description": "phenotype"})
+
+    # Safety check
+    required = ["snp_id", "Sub_Trait", "p_value"]
+    for col in required:
+        if col not in df.columns:
+            st.error(f"❌ Missing column: {col}")
+            st.write(df.columns)
+            st.stop()
+
+    df["snp_id"] = df["snp_id"].astype(str).str.strip()
 
     return df
 
 
 # =============================
-# FILE UPLOAD
+# LOAD DATA
+# =============================
+db_df = load_database()
+
+# =============================
+# PREVIEW
+# =============================
+st.subheader("📊 Database Preview")
+st.dataframe(db_df.head())
+
+
+# =============================
+# VCF UPLOAD
 # =============================
 uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
 
@@ -41,7 +62,7 @@ uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
 # PARSE VCF
 # =============================
 def parse_vcf(file):
-    vcf_data = []
+    data = []
 
     for line in file:
         line = line.decode("utf-8")
@@ -51,9 +72,9 @@ def parse_vcf(file):
 
         cols = line.strip().split("\t")
 
-        chr = cols[0]
-        pos = int(cols[1])
-        snp_id = cols[2]
+        snp_id = cols[2].strip()
+        chromosome = cols[0]
+        position = int(cols[1])
         ref = cols[3]
         alt = cols[4]
 
@@ -68,39 +89,53 @@ def parse_vcf(file):
         else:
             genotype = "NA"
 
-        vcf_data.append([snp_id, chr, pos, ref, alt, genotype])
+        data.append([snp_id, chromosome, position, ref, alt, genotype])
 
-    return pd.DataFrame(vcf_data, columns=[
-        "snp_id", "chromosome", "position", "ref", "alt", "genotype"
+    return pd.DataFrame(data, columns=[
+        "snp_id", "chromosome", "position",
+        "ref", "alt", "genotype"
     ])
 
 
 # =============================
-# ANNOTATION (NO SQLITE)
+# MATCHING
 # =============================
 def annotate(vcf_df):
-    db_df = load_database()
+    conn = sqlite3.connect(":memory:")
 
-    result = pd.merge(
-        vcf_df,
-        db_df,
-        on="snp_id",
-        how="left"
-    )
+    vcf_df.to_sql("vcf", conn, index=False, if_exists="replace")
+    db_df.to_sql("db", conn, index=False, if_exists="replace")
+
+    query = """
+    SELECT v.*, d.*
+    FROM vcf v
+    JOIN db d
+    ON v.snp_id = d.snp_id
+    """
+
+    result = pd.read_sql_query(query, conn)
+    conn.close()
 
     return result
 
 
 # =============================
-# SAS SCORING
+# SAS SCORE
 # =============================
 def sas_score(df):
-    matched = df[df["SAS_MAF"].notnull()]
-
-    if len(matched) == 0:
+    if "SAS_MAF" not in df.columns or len(df) == 0:
         return 0
+    return df["SAS_MAF"].mean() * 100
 
-    return matched["SAS_MAF"].mean() * 100
+
+# =============================
+# TOP SNP LOGIC
+# =============================
+def get_top_snps(group):
+    if len(group) >= 10:
+        return group.head(10)
+    else:
+        return group.head(5)
 
 
 # =============================
@@ -111,33 +146,76 @@ if uploaded_vcf is not None:
     st.write("🔄 Processing VCF...")
 
     vcf_df = parse_vcf(uploaded_vcf)
-    result_df = annotate(vcf_df)
-
-    score = sas_score(result_df)
+    matched_df = annotate(vcf_df)
 
     st.success("✅ Annotation Complete")
 
+    st.write("📊 Total SNPs:", len(vcf_df))
+    st.write("✅ Matched SNPs:", len(matched_df))
+
+    # SAS score
+    score = sas_score(matched_df)
     st.metric("🧬 SAS Score (%)", f"{score:.2f}")
 
-    st.dataframe(result_df.head(100))
+    # Show results
+    st.subheader("🔍 Matched SNPs")
+    st.dataframe(matched_df)
 
-    csv = result_df.to_csv(index=False).encode("utf-8")
+    # =============================
+    # TOP SNPs
+    # =============================
+    st.subheader("🏆 Top SNPs per Sub-Trait")
+
+    if len(matched_df) > 0:
+
+        df_top = matched_df.copy()
+
+        df_top["p_value"] = pd.to_numeric(df_top["p_value"], errors="coerce")
+        df_top = df_top.dropna(subset=["Sub_Trait", "p_value"])
+
+        df_top = df_top.sort_values(by="p_value")
+
+        top_snps = df_top.groupby("Sub_Trait", group_keys=False).apply(get_top_snps)
+
+        st.dataframe(top_snps[[
+            "Sub_Trait",
+            "snp_id",
+            "Gene",
+            "p_value",
+            "phenotype"
+        ]])
+
+    else:
+        st.warning("No matched SNPs")
+
+    # NOTE
+    st.info("ℹ️ 'Other' contains low-frequency or mixed traits.")
+
+    # DOWNLOAD
+    csv = matched_df.to_csv(index=False).encode("utf-8")
+
     st.download_button(
-        "⬇ Download Full Results",
+        "⬇ Download Results",
         csv,
-        "annotated_output.csv",
+        "matched_snps.csv",
         "text/csv"
     )
 
 
 # =============================
-# DATABASE VIEWER
+# RSID SEARCH
 # =============================
-st.subheader("📊 Database Viewer")
+st.subheader("🔍 Search SNP by rsID")
 
-db_df = load_database()
+search = st.text_input("Enter rsID")
 
-if st.checkbox("Show full database"):
-    st.dataframe(db_df)
+if search:
+    result = db_df[
+        db_df["snp_id"].str.contains(search.strip(), case=False, na=False)
+    ]
 
-st.write("Total SNPs:", len(db_df))
+    if len(result) > 0:
+        st.success(f"Found {len(result)} SNP(s)")
+        st.dataframe(result)
+    else:
+        st.warning("No SNP found")
