@@ -14,12 +14,12 @@ st.title("🧬 VCF Variant Annotation Tool")
 def load_database():
     df = pd.read_csv("annotated_table_updated.csv")
 
-    # Clean column names
+    # Clean columns
     df.columns = df.columns.astype(str)
     df.columns = df.columns.str.strip()
     df.columns = df.columns.str.replace(r"\s+", "_", regex=True)
 
-    # Rename safely
+    # Rename
     if "SNP_ID" in df.columns:
         df = df.rename(columns={"SNP_ID": "snp_id"})
     if "P-value" in df.columns:
@@ -27,18 +27,20 @@ def load_database():
     if "Phenotype_Description" in df.columns:
         df = df.rename(columns={"Phenotype_Description": "phenotype"})
 
-    # Safety check
+    # Ensure SAS column exists properly
+    for col in df.columns:
+        if "SAS" in col.upper():
+            df = df.rename(columns={col: "SAS_MAF"})
+
+    # Check required
     required = ["snp_id", "Sub_Trait", "p_value"]
     for col in required:
         if col not in df.columns:
             st.error(f"❌ Missing column: {col}")
-            st.write(df.columns)
             st.stop()
 
     df["snp_id"] = df["snp_id"].astype(str).str.strip()
-
     return df
-
 
 db_df = load_database()
 
@@ -49,45 +51,43 @@ st.subheader("📊 Database Preview")
 st.dataframe(db_df.head())
 
 # =============================
-# VCF UPLOAD
-# =============================
-uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
-
-# =============================
 # PARSE VCF
 # =============================
 def parse_vcf(file):
     data = []
 
     for line in file:
-        line = line.decode("utf-8")
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
 
         if line.startswith("#"):
             continue
 
         cols = line.strip().split("\t")
-
         if len(cols) < 10:
             continue
 
-        snp_id = cols[2].strip()
-        chromosome = cols[0]
-        position = int(cols[1])
-        ref = cols[3]
-        alt = cols[4]
+        try:
+            snp_id = cols[2].strip()
+            chromosome = cols[0]
+            position = int(cols[1])
+            ref = cols[3]
+            alt = cols[4]
 
-        gt_raw = cols[9].split(":")[0]
+            gt_raw = cols[9].split(":")[0]
 
-        if gt_raw == "0/0":
-            genotype = "0|0"
-        elif gt_raw in ["0/1", "1/0"]:
-            genotype = "0|1"
-        elif gt_raw == "1/1":
-            genotype = "1|1"
-        else:
-            genotype = "NA"
+            if gt_raw == "0/0":
+                genotype = "0|0"
+            elif gt_raw in ["0/1", "1/0"]:
+                genotype = "0|1"
+            elif gt_raw == "1/1":
+                genotype = "1|1"
+            else:
+                genotype = "NA"
 
-        data.append([snp_id, chromosome, position, ref, alt, genotype])
+            data.append([snp_id, chromosome, position, ref, alt, genotype])
+        except:
+            continue
 
     return pd.DataFrame(data, columns=[
         "snp_id", "chromosome", "position",
@@ -95,7 +95,35 @@ def parse_vcf(file):
     ])
 
 # =============================
-# MATCHING (SAFE SQL)
+# INPUT OPTION
+# =============================
+st.subheader("📂 Input VCF")
+
+input_method = st.radio(
+    "Choose input method:",
+    ["Upload VCF", "Use file path"]
+)
+
+vcf_df = None
+
+if input_method == "Upload VCF":
+    uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
+
+    if uploaded_vcf:
+        vcf_df = parse_vcf(uploaded_vcf)
+
+else:
+    file_path = st.text_input("Enter file path")
+
+    if file_path:
+        try:
+            with open(file_path, "rb") as f:
+                vcf_df = parse_vcf(f)
+        except Exception as e:
+            st.error(f"❌ {e}")
+
+# =============================
+# MATCHING
 # =============================
 def annotate(vcf_df):
     conn = sqlite3.connect(":memory:")
@@ -114,7 +142,8 @@ def annotate(vcf_df):
         d.Gene,
         d.Sub_Trait,
         d.p_value,
-        d.phenotype
+        d.phenotype,
+        d.SAS_MAF
     FROM vcf v
     JOIN db d
     ON v.snp_id = d.snp_id
@@ -122,90 +151,71 @@ def annotate(vcf_df):
 
     result = pd.read_sql_query(query, conn)
     conn.close()
-
     return result
 
 # =============================
-# SAS SCORE (SAFE)
+# SAS SCORE (FIXED)
 # =============================
 def sas_score(df):
     if "SAS_MAF" in df.columns and len(df) > 0:
+        df["SAS_MAF"] = pd.to_numeric(df["SAS_MAF"], errors="coerce")
         return df["SAS_MAF"].mean() * 100
     return 0
 
 # =============================
-# TOP SNP LOGIC
+# TOP SNP
 # =============================
 def get_top_snps(group):
-    if len(group) >= 10:
-        return group.head(10)
-    else:
-        return group.head(5)
+    return group.head(10) if len(group) >= 10 else group.head(5)
 
 # =============================
 # RUN PIPELINE
 # =============================
-if uploaded_vcf is not None:
+if vcf_df is not None:
 
-    st.write("🔄 Processing VCF...")
+    st.write("🔄 Processing...")
 
     try:
-        vcf_df = parse_vcf(uploaded_vcf)
         matched_df = annotate(vcf_df)
     except Exception as e:
-        st.error(f"❌ Error: {e}")
+        st.error(f"❌ {e}")
         st.stop()
 
-    st.success("✅ Annotation Complete")
+    st.success("✅ Done")
 
     st.write("📊 Total SNPs:", len(vcf_df))
     st.write("✅ Matched SNPs:", len(matched_df))
 
-    # =============================
     # SAS SCORE
-    # =============================
-    sas = sas_score(matched_df)
-    st.metric("🧬 SAS Score (%)", f"{sas:.2f}")
+    st.metric("🧬 SAS Score (%)", f"{sas_score(matched_df):.2f}")
 
-    # =============================
     # SHOW MATCHED
-    # =============================
     st.subheader("🔍 Matched SNPs")
     st.dataframe(matched_df)
 
-    # =============================
     # TOP SNPs
-    # =============================
     st.subheader("🏆 Top SNPs per Sub-Trait")
 
     if len(matched_df) > 0:
         df_top = matched_df.copy()
-
         df_top["p_value"] = pd.to_numeric(df_top["p_value"], errors="coerce")
         df_top = df_top.dropna(subset=["Sub_Trait", "p_value"])
         df_top = df_top.sort_values(by="p_value")
 
         top_snps = df_top.groupby("Sub_Trait", group_keys=False).apply(get_top_snps)
-
         st.dataframe(top_snps)
-
     else:
         st.warning("No matched SNPs")
 
-    # =============================
     # DOWNLOAD
-    # =============================
-    csv = matched_df.to_csv(index=False).encode("utf-8")
-
     st.download_button(
         "⬇ Download Results",
-        csv,
-        "matched_snps.csv",
-        "text/csv"
+        matched_df.to_csv(index=False),
+        "matched_snps.csv"
     )
 
 # =============================
-# RSID SEARCH
+# SEARCH
 # =============================
 st.subheader("🔍 Search SNP by rsID")
 
