@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+import gzip
 
 # =============================
 # TITLE
@@ -67,6 +68,9 @@ def parse_vcf(file):
 
         cols = line.strip().split("\t")
 
+        if len(cols) < 10:
+            continue  # safety
+
         snp_id = cols[2].strip()
         chromosome = cols[0]
         position = int(cols[1])
@@ -100,7 +104,6 @@ def annotate(vcf_df):
     vcf_df.to_sql("vcf", conn, index=False, if_exists="replace")
     db_df.to_sql("db", conn, index=False, if_exists="replace")
 
-    # SAFE QUERY (only guaranteed columns)
     query = """
     SELECT 
         v.snp_id,
@@ -113,7 +116,8 @@ def annotate(vcf_df):
         d.Gene,
         d.Sub_Trait,
         d.p_value,
-        d.phenotype
+        d.phenotype,
+        d.SAS_MAF
 
     FROM vcf v
     JOIN db d
@@ -126,12 +130,53 @@ def annotate(vcf_df):
     return result
 
 # =============================
-# SAS SCORE (SAFE)
+# SAS SCORE
 # =============================
 def sas_score(df):
     if "SAS_MAF" not in df.columns or len(df) == 0:
         return 0
     return df["SAS_MAF"].mean() * 100
+
+# =============================
+# IBS FUNCTIONS (gzip support)
+# =============================
+def load_reference():
+    try:
+        with gzip.open("reference.vcf.gz", "rt") as f:
+            return parse_vcf(f)
+    except:
+        st.warning("Reference VCF (.vcf.gz) not found")
+        return pd.DataFrame()
+
+def compare_vcf(user_df, ref_df):
+    return pd.merge(
+        user_df,
+        ref_df,
+        on="snp_id",
+        suffixes=("_user", "_ref")
+    )
+
+def calculate_ibs(df):
+    score = 0
+    count = 0
+
+    for _, row in df.iterrows():
+        g1 = str(row["genotype_user"])
+        g2 = str(row["genotype_ref"])
+
+        if g1 == g2:
+            score += 2
+        elif ("0|1" in g1) or ("0|1" in g2):
+            score += 1
+        else:
+            score += 0
+
+        count += 1
+
+    if count == 0:
+        return 0
+
+    return (score / (2 * count)) * 100
 
 # =============================
 # TOP SNP LOGIC
@@ -152,9 +197,8 @@ if uploaded_vcf is not None:
     try:
         vcf_df = parse_vcf(uploaded_vcf)
         matched_df = annotate(vcf_df)
-
     except Exception as e:
-        st.error(f"❌ Error during processing: {e}")
+        st.error(f"❌ Error: {e}")
         st.stop()
 
     st.success("✅ Annotation Complete")
@@ -162,7 +206,35 @@ if uploaded_vcf is not None:
     st.write("📊 Total SNPs:", len(vcf_df))
     st.write("✅ Matched SNPs:", len(matched_df))
 
-    # Show matched SNPs
+    # =============================
+    # SAS SCORE
+    # =============================
+    sas = sas_score(matched_df)
+    st.metric("🧬 SAS Score (%)", f"{sas:.2f}")
+
+    # =============================
+    # IBS
+    # =============================
+    st.subheader("🧬 IBS Similarity")
+
+    ref_df = load_reference()
+
+    if not ref_df.empty:
+        comparison_df = compare_vcf(vcf_df, ref_df)
+
+        st.write("🔗 Common SNPs:", len(comparison_df))
+
+        if len(comparison_df) > 0:
+            ibs = calculate_ibs(comparison_df)
+            st.metric("🧬 IBS Similarity (%)", f"{ibs:.2f}")
+        else:
+            st.warning("No overlapping SNPs")
+    else:
+        st.warning("Reference file missing")
+
+    # =============================
+    # SHOW MATCHED
+    # =============================
     st.subheader("🔍 Matched SNPs")
     st.dataframe(matched_df)
 
@@ -172,25 +244,21 @@ if uploaded_vcf is not None:
     st.subheader("🏆 Top SNPs per Sub-Trait")
 
     if len(matched_df) > 0:
-
         df_top = matched_df.copy()
 
         df_top["p_value"] = pd.to_numeric(df_top["p_value"], errors="coerce")
         df_top = df_top.dropna(subset=["Sub_Trait", "p_value"])
-
         df_top = df_top.sort_values(by="p_value")
 
         top_snps = df_top.groupby("Sub_Trait", group_keys=False).apply(get_top_snps)
 
         st.dataframe(top_snps)
-
     else:
         st.warning("No matched SNPs")
 
-    # NOTE
-    st.info("ℹ️ 'Other' contains low-frequency or mixed traits.")
-
+    # =============================
     # DOWNLOAD
+    # =============================
     csv = matched_df.to_csv(index=False).encode("utf-8")
 
     st.download_button(
