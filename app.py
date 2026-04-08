@@ -14,12 +14,10 @@ st.title("🧬 VCF Variant Annotation Tool")
 def load_database():
     df = pd.read_csv("annotated_table_updated.csv")
 
-    # Clean columns
     df.columns = df.columns.astype(str)
     df.columns = df.columns.str.strip()
     df.columns = df.columns.str.replace(r"\s+", "_", regex=True)
 
-    # Rename
     if "SNP_ID" in df.columns:
         df = df.rename(columns={"SNP_ID": "snp_id"})
     if "P-value" in df.columns:
@@ -27,19 +25,13 @@ def load_database():
     if "Phenotype_Description" in df.columns:
         df = df.rename(columns={"Phenotype_Description": "phenotype"})
 
-    # Ensure SAS column exists properly
+    # Fix SAS column
     for col in df.columns:
         if "SAS" in col.upper():
             df = df.rename(columns={col: "SAS_MAF"})
 
-    # Check required
-    required = ["snp_id", "Sub_Trait", "p_value"]
-    for col in required:
-        if col not in df.columns:
-            st.error(f"❌ Missing column: {col}")
-            st.stop()
-
     df["snp_id"] = df["snp_id"].astype(str).str.strip()
+
     return df
 
 db_df = load_database()
@@ -74,13 +66,13 @@ def parse_vcf(file):
             ref = cols[3]
             alt = cols[4]
 
-            gt_raw = cols[9].split(":")[0]
+            gt = cols[9].split(":")[0]
 
-            if gt_raw == "0/0":
+            if gt == "0/0":
                 genotype = "0|0"
-            elif gt_raw in ["0/1", "1/0"]:
+            elif gt in ["0/1", "1/0"]:
                 genotype = "0|1"
-            elif gt_raw == "1/1":
+            elif gt == "1/1":
                 genotype = "1|1"
             else:
                 genotype = "NA"
@@ -95,32 +87,11 @@ def parse_vcf(file):
     ])
 
 # =============================
-# INPUT OPTION
+# INPUT
 # =============================
 st.subheader("📂 Input VCF")
 
-input_method = st.radio(
-    "Choose input method:",
-    ["Upload VCF", "Use file path"]
-)
-
-vcf_df = None
-
-if input_method == "Upload VCF":
-    uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
-
-    if uploaded_vcf:
-        vcf_df = parse_vcf(uploaded_vcf)
-
-else:
-    file_path = st.text_input("Enter file path")
-
-    if file_path:
-        try:
-            with open(file_path, "rb") as f:
-                vcf_df = parse_vcf(f)
-        except Exception as e:
-            st.error(f"❌ {e}")
+uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
 
 # =============================
 # MATCHING
@@ -154,7 +125,7 @@ def annotate(vcf_df):
     return result
 
 # =============================
-# SAS SCORE (FIXED)
+# SAS SCORE
 # =============================
 def sas_score(df):
     if "SAS_MAF" in df.columns and len(df) > 0:
@@ -163,71 +134,103 @@ def sas_score(df):
     return 0
 
 # =============================
-# TOP SNP
+# LOAD SMALL REFERENCE (SAFE)
 # =============================
-def get_top_snps(group):
-    return group.head(10) if len(group) >= 10 else group.head(5)
+def load_reference():
+    try:
+        with open("S25.vcf", "rb") as f:
+            return parse_vcf(f)
+    except:
+        return pd.DataFrame()
+
+# =============================
+# IBS CALCULATION
+# =============================
+def calculate_ibs(df):
+    score = 0
+    count = 0
+
+    for _, row in df.iterrows():
+        g1 = str(row["genotype_user"])
+        g2 = str(row["genotype_ref"])
+
+        if g1 == g2:
+            score += 2
+        elif "0|1" in g1 or "0|1" in g2:
+            score += 1
+
+        count += 1
+
+    return (score / (2 * count)) * 100 if count else 0
 
 # =============================
 # RUN PIPELINE
 # =============================
-if vcf_df is not None:
+if uploaded_vcf:
 
     st.write("🔄 Processing...")
 
-    try:
-        matched_df = annotate(vcf_df)
-    except Exception as e:
-        st.error(f"❌ {e}")
-        st.stop()
+    vcf_df = parse_vcf(uploaded_vcf)
+
+    # LIMIT SIZE (IMPORTANT)
+    vcf_df = vcf_df.head(3000)
+
+    matched_df = annotate(vcf_df)
 
     st.success("✅ Done")
 
     st.write("📊 Total SNPs:", len(vcf_df))
     st.write("✅ Matched SNPs:", len(matched_df))
 
-    # SAS SCORE
+    # SAS
     st.metric("🧬 SAS Score (%)", f"{sas_score(matched_df):.2f}")
 
-    # SHOW MATCHED
+    # =============================
+    # IBS
+    # =============================
+    st.subheader("🧬 IBS Similarity")
+
+    ref_df = load_reference()
+
+    if not ref_df.empty:
+
+        comp = pd.merge(
+            vcf_df,
+            ref_df,
+            on="snp_id",
+            suffixes=("_user", "_ref")
+        )
+
+        st.write("🔗 Common SNPs:", len(comp))
+
+        if len(comp) > 0:
+            ibs = calculate_ibs(comp)
+            st.metric("IBS (%)", f"{ibs:.2f}")
+        else:
+            st.warning("No overlapping SNPs")
+
+    else:
+        st.warning("Reference file missing")
+
+    # =============================
+    # OUTPUT
+    # =============================
     st.subheader("🔍 Matched SNPs")
     st.dataframe(matched_df)
-
-    # TOP SNPs
-    st.subheader("🏆 Top SNPs per Sub-Trait")
-
-    if len(matched_df) > 0:
-        df_top = matched_df.copy()
-        df_top["p_value"] = pd.to_numeric(df_top["p_value"], errors="coerce")
-        df_top = df_top.dropna(subset=["Sub_Trait", "p_value"])
-        df_top = df_top.sort_values(by="p_value")
-
-        top_snps = df_top.groupby("Sub_Trait", group_keys=False).apply(get_top_snps)
-        st.dataframe(top_snps)
-    else:
-        st.warning("No matched SNPs")
-
-    # DOWNLOAD
-    st.download_button(
-        "⬇ Download Results",
-        matched_df.to_csv(index=False),
-        "matched_snps.csv"
-    )
 
 # =============================
 # SEARCH
 # =============================
-st.subheader("🔍 Search SNP by rsID")
+st.subheader("🔍 Search SNP")
 
 search = st.text_input("Enter rsID")
 
 if search:
-    result = db_df[
-        db_df["snp_id"].str.contains(search.strip(), case=False, na=False)
+    res = db_df[
+        db_df["snp_id"].str.contains(search, case=False, na=False)
     ]
 
-    if len(result) > 0:
-        st.success(f"Found {len(result)} SNP(s)")
-        st.dataframe(result)
+    if len(res) > 0:
+        st.dataframe(res)
     else:
-        st.warning("No SNP found")
+        st.warning("No match found")
