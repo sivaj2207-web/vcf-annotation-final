@@ -9,7 +9,7 @@ import gzip
 st.title("🧬 VCF Variant Annotation Tool")
 
 # =============================
-# LOAD DATABASE
+# LOAD DATABASE (SAS + MATCHING)
 # =============================
 @st.cache_data
 def load_database():
@@ -42,10 +42,11 @@ st.subheader("📊 Database Preview")
 st.dataframe(db_df.head())
 
 # =============================
-# PARSE VCF
+# PARSE VCF (SAFE FOR LARGE FILES)
 # =============================
-def parse_vcf(file):
+def parse_vcf(file, limit=10000):
     data = []
+    count = 0
 
     for line in file:
         if isinstance(line, bytes):
@@ -80,6 +81,11 @@ def parse_vcf(file):
                 genotype = "NA"
 
             data.append([snp_id, chromosome, position, ref, alt, genotype])
+            count += 1
+
+            if count >= limit:  # 🔥 prevents crash
+                break
+
         except:
             continue
 
@@ -89,18 +95,42 @@ def parse_vcf(file):
     ])
 
 # =============================
-# INPUT
+# USER VCF INPUT
 # =============================
-st.subheader("📂 Input VCF")
+st.subheader("📂 Upload User VCF")
 
-uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
+user_vcf_file = st.file_uploader("Upload User VCF", type=["vcf"])
 
 vcf_df = None
-if uploaded_vcf:
-    vcf_df = parse_vcf(uploaded_vcf)
+if user_vcf_file:
+    vcf_df = parse_vcf(user_vcf_file, limit=10000)
 
 # =============================
-# MATCHING
+# IBS REFERENCE INPUT (NEW)
+# =============================
+st.subheader("🧬 IBS Reference Input")
+
+ibs_ref_file = st.file_uploader(
+    "Upload Reference VCF for IBS (.vcf or .vcf.gz)",
+    type=["vcf", "gz"]
+)
+
+def load_reference(file):
+    try:
+        if file is None:
+            return pd.DataFrame()
+
+        if file.name.endswith(".gz"):
+            return parse_vcf(gzip.open(file, "rt"), limit=10000)
+        else:
+            return parse_vcf(file, limit=10000)
+
+    except Exception as e:
+        st.warning(f"Reference load failed: {e}")
+        return pd.DataFrame()
+
+# =============================
+# MATCHING (DB ONLY)
 # =============================
 def annotate(vcf_df):
     conn = sqlite3.connect(":memory:")
@@ -140,15 +170,8 @@ def sas_score(df):
     return 0
 
 # =============================
-# IBS
+# IBS CALCULATION
 # =============================
-def load_reference():
-    try:
-        with gzip.open("final.vcf.gz", "rt") as f:
-            return parse_vcf(f)
-    except:
-        return pd.DataFrame()
-
 def calculate_ibs(df):
     if len(df) == 0:
         return 0
@@ -171,42 +194,42 @@ if vcf_df is not None:
 
     st.write("🔄 Processing...")
 
-    try:
-        matched_df = annotate(vcf_df)   # ✅ FULL VCF used
-    except Exception as e:
-        st.error(f"❌ {e}")
-        st.stop()
+    # MATCHING + SAS (FULL DATA)
+    matched_df = annotate(vcf_df)
 
     st.success("✅ Done")
 
     st.write("📊 Total SNPs:", len(vcf_df))
     st.write("✅ Matched SNPs:", len(matched_df))
 
-    # SAS
     st.metric("🧬 SAS Score (%)", f"{sas_score(matched_df):.2f}")
 
     # =============================
-    # IBS (FIXED LOGIC)
+    # IBS (SEPARATE REFERENCE)
     # =============================
     st.subheader("🧬 IBS Similarity")
 
-    ref_df = load_reference()
+    ref_df = load_reference(ibs_ref_file)
 
-    if not ref_df.empty:
+    if ibs_ref_file is None:
+        st.warning("Upload IBS reference file")
+    elif not ref_df.empty:
 
-        # 🔥 Find COMMON SNPs FIRST
+        # 🔥 find overlap first
         common_ids = set(vcf_df["snp_id"]) & set(ref_df["snp_id"])
 
         vcf_common = vcf_df[vcf_df["snp_id"].isin(common_ids)]
         ref_common = ref_df[ref_df["snp_id"].isin(common_ids)]
 
-        # 🔥 THEN sample (avoids crash + ensures overlap)
-        vcf_sample = vcf_common.head(3000)
-        ref_sample = ref_common.head(3000)
+        # 🔥 random sampling
+        if len(vcf_common) > 3000:
+            vcf_common = vcf_common.sample(3000, random_state=42)
+        if len(ref_common) > 3000:
+            ref_common = ref_common.sample(3000, random_state=42)
 
         comp = pd.merge(
-            vcf_sample,
-            ref_sample,
+            vcf_common,
+            ref_common,
             on="snp_id",
             suffixes=("_user", "_ref")
         )
@@ -220,7 +243,7 @@ if vcf_df is not None:
             st.warning("No overlapping SNPs")
 
     else:
-        st.warning("Reference missing")
+        st.warning("Reference loading failed")
 
     # =============================
     # OUTPUT
