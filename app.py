@@ -30,7 +30,7 @@ def load_database():
         if "SAS" in col.upper():
             df = df.rename(columns={col: "SAS_MAF"})
 
-    df["snp_id"] = df["snp_id"].astype(str).str.strip()
+    df["snp_id"] = df["snp_id"].astype(str).str.strip().str.lower()
     return df
 
 db_df = load_database()
@@ -46,6 +46,7 @@ st.dataframe(db_df.head())
 # =============================
 def parse_vcf(file):
     data = []
+
     for line in file:
         if isinstance(line, bytes):
             line = line.decode("utf-8")
@@ -58,7 +59,7 @@ def parse_vcf(file):
             continue
 
         try:
-            snp_id = cols[2].strip()
+            snp_id = cols[2].strip().lower()
             if snp_id == ".":
                 continue
 
@@ -82,13 +83,10 @@ def parse_vcf(file):
         except:
             continue
 
-    df = pd.DataFrame(data, columns=[
+    return pd.DataFrame(data, columns=[
         "snp_id", "chromosome", "position",
         "ref", "alt", "genotype"
     ])
-
-    df["snp_id"] = df["snp_id"].str.lower().str.strip()
-    return df
 
 # =============================
 # INPUT
@@ -133,7 +131,7 @@ def annotate(vcf_df):
     return result
 
 # =============================
-# SAS
+# SAS SCORE
 # =============================
 def sas_score(df):
     if "SAS_MAF" in df.columns and len(df) > 0:
@@ -147,7 +145,7 @@ def sas_score(df):
 def load_reference():
     try:
         with gzip.open("final.vcf.gz", "rt") as f:
-            return parse_vcf(f).head(3000)  # limit reference
+            return parse_vcf(f)
     except:
         return pd.DataFrame()
 
@@ -167,14 +165,14 @@ def get_top_snps(group):
     return group.head(10) if len(group) >= 10 else group.head(5)
 
 # =============================
-# RUN
+# RUN PIPELINE
 # =============================
 if vcf_df is not None:
 
     st.write("🔄 Processing...")
 
     try:
-        matched_df = annotate(vcf_df)   # ✅ FULL VCF used here
+        matched_df = annotate(vcf_df)   # ✅ FULL VCF used
     except Exception as e:
         st.error(f"❌ {e}")
         st.stop()
@@ -188,20 +186,30 @@ if vcf_df is not None:
     st.metric("🧬 SAS Score (%)", f"{sas_score(matched_df):.2f}")
 
     # =============================
-    # IBS (ONLY SAMPLE USED)
+    # IBS (FIXED LOGIC)
     # =============================
     st.subheader("🧬 IBS Similarity")
 
-    vcf_sample = vcf_df.head(3000)  # 🔥 only for IBS
     ref_df = load_reference()
 
     if not ref_df.empty:
+
+        # 🔥 Find COMMON SNPs FIRST
+        common_ids = set(vcf_df["snp_id"]) & set(ref_df["snp_id"])
+
+        vcf_common = vcf_df[vcf_df["snp_id"].isin(common_ids)]
+        ref_common = ref_df[ref_df["snp_id"].isin(common_ids)]
+
+        # 🔥 THEN sample (avoids crash + ensures overlap)
+        vcf_sample = vcf_common.head(3000)
+        ref_sample = ref_common.head(3000)
+
         comp = pd.merge(
             vcf_sample,
-            ref_df,
+            ref_sample,
             on="snp_id",
             suffixes=("_user", "_ref")
-        ).head(2000)
+        )
 
         st.write("🔗 Common SNPs:", len(comp))
 
@@ -210,6 +218,7 @@ if vcf_df is not None:
             st.metric("🧬 IBS (%)", f"{ibs:.2f}")
         else:
             st.warning("No overlapping SNPs")
+
     else:
         st.warning("Reference missing")
 
@@ -245,7 +254,7 @@ search = st.text_input("Enter rsID")
 
 if search:
     result = db_df[
-        db_df["snp_id"].str.contains(search.strip(), case=False, na=False)
+        db_df["snp_id"].str.contains(search.strip().lower(), case=False, na=False)
     ]
 
     if len(result) > 0:
