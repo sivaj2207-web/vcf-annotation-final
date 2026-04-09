@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import gzip
+import requests
+import io
 
 # =============================
 # TITLE
@@ -9,7 +10,7 @@ import gzip
 st.title("🧬 VCF Variant Annotation Tool")
 
 # =============================
-# LOAD DATABASE (SAS + MATCHING)
+# LOAD DATABASE
 # =============================
 @st.cache_data
 def load_database():
@@ -42,7 +43,7 @@ st.subheader("📊 Database Preview")
 st.dataframe(db_df.head())
 
 # =============================
-# PARSE VCF (SAFE FOR LARGE FILES)
+# PARSE VCF (SAFE)
 # =============================
 def parse_vcf(file, limit=10000):
     data = []
@@ -83,7 +84,7 @@ def parse_vcf(file, limit=10000):
             data.append([snp_id, chromosome, position, ref, alt, genotype])
             count += 1
 
-            if count >= limit:  # 🔥 prevents crash
+            if count >= limit:  # prevents crash
                 break
 
         except:
@@ -95,42 +96,60 @@ def parse_vcf(file, limit=10000):
     ])
 
 # =============================
-# USER VCF INPUT
+# INPUT OPTIONS
 # =============================
-st.subheader("📂 Upload User VCF")
+st.subheader("📂 Input VCF")
 
-user_vcf_file = st.file_uploader("Upload User VCF", type=["vcf"])
-
-vcf_df = None
-if user_vcf_file:
-    vcf_df = parse_vcf(user_vcf_file, limit=10000)
-
-# =============================
-# IBS REFERENCE INPUT (NEW)
-# =============================
-st.subheader("🧬 IBS Reference Input")
-
-ibs_ref_file = st.file_uploader(
-    "Upload Reference VCF for IBS (.vcf or .vcf.gz)",
-    type=["vcf", "gz"]
+input_method = st.radio(
+    "Choose input method:",
+    ["Upload VCF", "Use file path", "Paste URL"]
 )
 
-def load_reference(file):
-    try:
-        if file is None:
-            return pd.DataFrame()
+vcf_df = None
 
-        if file.name.endswith(".gz"):
-            return parse_vcf(gzip.open(file, "rt"), limit=10000)
-        else:
-            return parse_vcf(file, limit=10000)
+# -------- Upload --------
+if input_method == "Upload VCF":
+    uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
+    if uploaded_vcf:
+        st.write(f"File size: {uploaded_vcf.size / (1024*1024):.2f} MB")
+        if st.button("🚀 Process File"):
+            with st.spinner("⏳ Processing VCF..."):
+                vcf_df = parse_vcf(uploaded_vcf, limit=10000)
 
-    except Exception as e:
-        st.warning(f"Reference load failed: {e}")
-        return pd.DataFrame()
+# -------- File Path --------
+elif input_method == "Use file path":
+    file_path = st.text_input("Enter file path")
+
+    if file_path:
+        if st.button("🚀 Process File"):
+            try:
+                with st.spinner("⏳ Reading file..."):
+                    with open(file_path, "rb") as f:
+                        vcf_df = parse_vcf(f, limit=10000)
+            except Exception as e:
+                st.error(f"❌ {e}")
+
+# -------- URL --------
+elif input_method == "Paste URL":
+    url = st.text_input("Paste VCF file URL")
+
+    if url:
+        if st.button("🚀 Process File"):
+            try:
+                with st.spinner("⏳ Downloading + processing VCF..."):
+                    response = requests.get(url, stream=True)
+
+                    if response.status_code == 200:
+                        file_like = io.BytesIO(response.content)
+                        vcf_df = parse_vcf(file_like, limit=10000)
+                    else:
+                        st.error("❌ Failed to download file")
+
+            except Exception as e:
+                st.error(f"❌ {e}")
 
 # =============================
-# MATCHING (DB ONLY)
+# MATCHING
 # =============================
 def annotate(vcf_df):
     conn = sqlite3.connect(":memory:")
@@ -170,18 +189,6 @@ def sas_score(df):
     return 0
 
 # =============================
-# IBS CALCULATION
-# =============================
-def calculate_ibs(df):
-    if len(df) == 0:
-        return 0
-
-    match = (df["genotype_user"] == df["genotype_ref"]).sum()
-    het = ((df["genotype_user"] == "0|1") | (df["genotype_ref"] == "0|1")).sum()
-
-    return ((2 * match + het) / (2 * len(df))) * 100
-
-# =============================
 # TOP SNP
 # =============================
 def get_top_snps(group):
@@ -192,62 +199,15 @@ def get_top_snps(group):
 # =============================
 if vcf_df is not None:
 
-    st.write("🔄 Processing...")
+    st.success("✅ Processing Complete")
 
-    # MATCHING + SAS (FULL DATA)
     matched_df = annotate(vcf_df)
-
-    st.success("✅ Done")
 
     st.write("📊 Total SNPs:", len(vcf_df))
     st.write("✅ Matched SNPs:", len(matched_df))
 
     st.metric("🧬 SAS Score (%)", f"{sas_score(matched_df):.2f}")
 
-    # =============================
-    # IBS (SEPARATE REFERENCE)
-    # =============================
-    st.subheader("🧬 IBS Similarity")
-
-    ref_df = load_reference(ibs_ref_file)
-
-    if ibs_ref_file is None:
-        st.warning("Upload IBS reference file")
-    elif not ref_df.empty:
-
-        # 🔥 find overlap first
-        common_ids = set(vcf_df["snp_id"]) & set(ref_df["snp_id"])
-
-        vcf_common = vcf_df[vcf_df["snp_id"].isin(common_ids)]
-        ref_common = ref_df[ref_df["snp_id"].isin(common_ids)]
-
-        # 🔥 random sampling
-        if len(vcf_common) > 3000:
-            vcf_common = vcf_common.sample(3000, random_state=42)
-        if len(ref_common) > 3000:
-            ref_common = ref_common.sample(3000, random_state=42)
-
-        comp = pd.merge(
-            vcf_common,
-            ref_common,
-            on="snp_id",
-            suffixes=("_user", "_ref")
-        )
-
-        st.write("🔗 Common SNPs:", len(comp))
-
-        if len(comp) > 0:
-            ibs = calculate_ibs(comp)
-            st.metric("🧬 IBS (%)", f"{ibs:.2f}")
-        else:
-            st.warning("No overlapping SNPs")
-
-    else:
-        st.warning("Reference loading failed")
-
-    # =============================
-    # OUTPUT
-    # =============================
     st.subheader("🔍 Matched SNPs")
     st.dataframe(matched_df)
 
@@ -261,6 +221,8 @@ if vcf_df is not None:
 
         top_snps = df_top.groupby("Sub_Trait", group_keys=False).apply(get_top_snps)
         st.dataframe(top_snps)
+    else:
+        st.warning("No matched SNPs")
 
     st.download_button(
         "⬇ Download Results",
