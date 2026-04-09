@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+import gzip
 
 # =============================
 # TITLE
@@ -47,13 +48,16 @@ st.subheader("📊 Database Preview")
 st.dataframe(db_df.head())
 
 # =============================
-# PARSE VCF
+# PARSE VCF (SAFE FOR LARGE FILES)
 # =============================
-def parse_vcf(file):
+def parse_vcf(file, limit=5000):
     data = []
+    count = 0
+
     for line in file:
         if isinstance(line, bytes):
             line = line.decode("utf-8")
+
         if line.startswith("#"):
             continue
 
@@ -80,6 +84,11 @@ def parse_vcf(file):
                 genotype = "NA"
 
             data.append([snp_id, chromosome, position, ref, alt, genotype])
+            count += 1
+
+            if count >= limit:  # 🔥 prevents crash
+                break
+
         except:
             continue
 
@@ -104,8 +113,9 @@ if input_method == "Upload VCF":
     uploaded_vcf = st.file_uploader("Upload VCF file", type=["vcf"])
     if uploaded_vcf:
         vcf_df = parse_vcf(uploaded_vcf)
+
 else:
-    file_path = st.text_input("Enter file path")
+    file_path = st.text_input("Enter file path (repo only)")
     if file_path:
         try:
             with open(file_path, "rb") as f:
@@ -154,31 +164,25 @@ def sas_score(df):
     return 0
 
 # =============================
-# IBS (SAFE ADDITION)
+# IBS (FINAL SAFE VERSION)
 # =============================
 def load_reference():
     try:
-        with open("S25.vcf", "rb") as f:
-            return parse_vcf(f)
-    except:
+        with gzip.open("final.vcf.gz", "rt") as f:
+            return parse_vcf(f, limit=3000)  # 🔥 limit reference
+    except Exception as e:
+        st.warning(f"Reference load failed: {e}")
         return pd.DataFrame()
 
 def calculate_ibs(df):
-    score = 0
-    count = 0
+    if len(df) == 0:
+        return 0
 
-    for _, row in df.iterrows():
-        g1 = str(row["genotype_user"])
-        g2 = str(row["genotype_ref"])
+    match = (df["genotype_user"] == df["genotype_ref"]).sum()
+    het = ((df["genotype_user"] == "0|1") | (df["genotype_ref"] == "0|1")).sum()
 
-        if g1 == g2:
-            score += 2
-        elif "0|1" in g1 or "0|1" in g2:
-            score += 1
-
-        count += 1
-
-    return (score / (2 * count)) * 100 if count else 0
+    score = (2 * match + het) / (2 * len(df))
+    return score * 100
 
 # =============================
 # TOP SNP
@@ -193,8 +197,7 @@ if vcf_df is not None:
 
     st.write("🔄 Processing...")
 
-    # 🔥 LIMIT SIZE → prevents crash
-    vcf_df = vcf_df.head(3000)
+    vcf_df = vcf_df.head(3000)  # 🔥 limit user file
 
     try:
         matched_df = annotate(vcf_df)
@@ -207,11 +210,11 @@ if vcf_df is not None:
     st.write("📊 Total SNPs:", len(vcf_df))
     st.write("✅ Matched SNPs:", len(matched_df))
 
-    # SAS SCORE
+    # SAS
     st.metric("🧬 SAS Score (%)", f"{sas_score(matched_df):.2f}")
 
     # =============================
-    # IBS (NEW BLOCK)
+    # IBS
     # =============================
     st.subheader("🧬 IBS Similarity")
 
@@ -225,6 +228,8 @@ if vcf_df is not None:
             suffixes=("_user", "_ref")
         )
 
+        comp = comp.head(2000)  # 🔥 limit merge
+
         st.write("🔗 Common SNPs:", len(comp))
 
         if len(comp) > 0:
@@ -236,14 +241,11 @@ if vcf_df is not None:
         st.warning("Reference file missing")
 
     # =============================
-    # SHOW MATCHED
+    # OUTPUT
     # =============================
     st.subheader("🔍 Matched SNPs")
     st.dataframe(matched_df)
 
-    # =============================
-    # TOP SNPs
-    # =============================
     st.subheader("🏆 Top SNPs per Sub-Trait")
 
     if len(matched_df) > 0:
@@ -254,8 +256,6 @@ if vcf_df is not None:
 
         top_snps = df_top.groupby("Sub_Trait", group_keys=False).apply(get_top_snps)
         st.dataframe(top_snps)
-    else:
-        st.warning("No matched SNPs")
 
     # DOWNLOAD
     st.download_button(
